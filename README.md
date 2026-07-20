@@ -6,15 +6,18 @@ Debian 13 ships Python 3.13 by default, which is incompatible with AUTOMATIC1111
 
 ## What this script does
 
-1. Verifies the NVIDIA driver is present (`nvidia-smi`)
-2. Redirects `TMPDIR` / pip cache to disk (important on low-RAM systems, so downloads and build artifacts don't end up on a RAM-backed `/tmp`)
-3. Installs required system packages (build tools, git, etc.)
-4. Installs pyenv (if not already present)
-5. Builds Python 3.11.11 via pyenv, side by side with the system Python
-6. Clones `AUTOMATIC1111/stable-diffusion-webui`
-7. Writes `webui-user.sh` with the pyenv Python path, sane launch args, and a working fork for the Stable Diffusion base repo
-8. Proactively creates the venv and installs torch/torchvision and CLIP manually, before the first `webui.sh` run
-9. Launches `webui.sh`, which installs only the remaining, unproblematic requirements and starts the web UI on `http://127.0.0.1:7860` (also reachable on the LAN, see below)
+1. Verifies the NVIDIA driver is present (`nvidia-smi`). If not found, warns the user and waits up to 10 seconds for an explicit confirmation to continue anyway (CPU-only); aborts on timeout, no input, or a non-"y" answer
+2. Asks whether pyenv/Python should be installed system-wide (`/opt/pyenv`, readable by all users) or per-user (`$HOME/.pyenv`) — relevant if the WebUI might later run under a different Linux user
+3. Checks available RAM (locale-independent, with a fallback if the `available` column is missing from `free`). Only if it's below 8 GB does it ask (10s timeout, defaults to yes) whether to redirect `TMPDIR`/pip cache to `/var/tmp`, so pip/torch downloads and build artifacts don't fill up RAM on a tmpfs-backed `/tmp`. Skipped entirely on systems with 8 GB+ RAM available
+4. Asks (10s timeout, defaults to yes) whether the systemd service (set up later) should be enabled for automatic start on boot
+5. Installs required system packages (build tools, git, etc.)
+6. Installs pyenv (if not already present), in the chosen scope
+7. Builds Python 3.11.11 via pyenv, side by side with the system Python
+8. Clones `AUTOMATIC1111/stable-diffusion-webui`
+9. Writes `webui-user.sh` with the pyenv Python path, sane launch args (`--medvram --xformers --listen --port 7860`), and a working fork for the Stable Diffusion base repo
+10. Proactively creates the venv and installs torch/torchvision and CLIP manually, before the first `webui.sh` run
+11. Writes a systemd unit file (`stable-diffusion-webui.service`) so the WebUI can be managed via `systemctl` afterwards, and enables it for autostart if confirmed in step 4
+12. Launches `webui.sh` once in the foreground for the initial setup and verification; use the systemd service for all later starts
 
 ## Known issues this script works around
 
@@ -24,6 +27,7 @@ Debian 13 ships Python 3.13 by default, which is incompatible with AUTOMATIC1111
 | `ModuleNotFoundError: No module named 'pkg_resources'` while installing CLIP | Modern `setuptools` removed `pkg_resources`; the old (2021) CLIP package still needs it during its isolated pip build | Installs `setuptools<81` + `wheel`, then installs CLIP with `--no-build-isolation` *before* `webui.sh` runs, so AUTOMATIC1111's own `is_installed("clip")` check skips its fragile install step entirely |
 | `A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x` | `torch==2.1.2` was compiled against NumPy 1.x | Pins `numpy<2` |
 | Git clone of `Stability-AI/stablediffusion` asks for a GitHub login / fails with 401 | The original repository was removed/privatized from public GitHub (a confirmed, global issue affecting all fresh AUTOMATIC1111 installs since ~December 2025) | Sets `STABLE_DIFFUSION_REPO` to `w-e-w/stablediffusion.git`, the fork recommended by the AUTOMATIC1111 project itself (used on its `dev` branch) |
+| RAM check silently reports empty/wrong values on non-English locales | `free`'s row label is translated (e.g. German locales show `Speicher:` instead of `Mem:`), so pattern matching on `Mem:` fails | Runs `free -m` with `LC_ALL=C` to force the English row label regardless of system locale, with a fallback to the `free` column if the `available` column is missing (older `procps` versions) |
 
 ## Prerequisites
 
@@ -35,12 +39,42 @@ Debian 13 ships Python 3.13 by default, which is incompatible with AUTOMATIC1111
 ## Usage
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
-bash SD-Automatic1111_install_D13.sh
+git clone https://github.com/AIScriptHub/stable-diffusion_AUTOMATIC1111_debian-13_install.git
+cd stable-diffusion_AUTOMATIC1111_debian-13_install
+bash stable-diffusion_AUTOMATIC1111_debian-13_install_v0.4.sh
 ```
 
 The script is idempotent: steps that were already completed in a previous run (pyenv, Python 3.11.11, the repository clone, the venv) are automatically skipped on subsequent runs.
+
+## Interactive prompts
+
+The script asks a few yes/no questions during the run. Each has a 10-second timeout:
+
+| Prompt | Default on timeout/no input | Purpose |
+|---|---|---|
+| Continue without an NVIDIA driver? | **No** (aborts) | Safety default — CPU-only is not what this script's CUDA setup targets |
+| System-wide or per-user pyenv install? | *(no timeout — waits for `1` or `2`)* | See below |
+| Redirect TMPDIR/pip cache to `/var/tmp`? | **Yes** (only asked if available RAM < 8 GB) | Prevents pip/torch build files from filling up RAM-backed `/tmp` |
+| Enable systemd autostart on boot? | **Yes** | Whether the WebUI should start automatically after a reboot |
+
+### pyenv installation scope
+
+- **System-wide** (`/opt/pyenv`, requires sudo): recommended if the WebUI might later run under a different Linux user. Environment is exposed via `/etc/profile.d/pyenv.sh`, readable by all users. Per-user `venv`s are still required for each user — only the Python interpreter itself is shared.
+- **User-space** (`$HOME/.pyenv`): simpler, no system-wide changes, but the `python_cmd` path in `webui-user.sh` only resolves for the user who ran the script.
+
+## systemd service
+
+The script writes `/etc/systemd/system/stable-diffusion-webui.service`, so the WebUI can be managed like any other system service:
+
+```bash
+sudo systemctl start   stable-diffusion-webui
+sudo systemctl stop    stable-diffusion-webui
+sudo systemctl status  stable-diffusion-webui
+sudo systemctl enable  stable-diffusion-webui   # start automatically on boot
+journalctl -u stable-diffusion-webui -f          # follow logs
+```
+
+`webui-user.sh` still controls `python_cmd`, `COMMANDLINE_ARGS`, and `STABLE_DIFFUSION_REPO` — the service just calls `webui.sh`, the same as running it manually would. If a TMPDIR redirect was applied (see above), the service's `Environment=` lines carry it over so it also applies to later model downloads and image generation, not just the initial install.
 
 ## LAN access
 
@@ -50,7 +84,8 @@ By default the web UI only listens on `127.0.0.1`. The script's generated `webui
 
 ## Tested on
 
-- Debian 13 netinstall, 6 GB RAM, NVIDIA GPU (driver already installed)
+- Debian 13 netinstall, ~6 GB RAM, NVIDIA GPU (driver already installed) — with the TMPDIR redirect prompt
+- Debian 13, ~8 GB RAM, NVIDIA GPU — with the TMPDIR redirect skipped automatically
 
 ## Re-running / troubleshooting
 
@@ -60,6 +95,22 @@ If a run fails partway through, simply re-run the script — completed steps are
 rm -rf ~/stable-diffusion-webui/venv
 bash SD-Automatic1111_install_D13.sh
 ```
+## Disclaimer
+
+This script is provided as-is, without warranty. It automates commands based on a working, real-world installation on Debian 13; results may vary depending on hardware and system configuration.
+
+---
+
+## Support this project
+
+If this script saved you time, consider supporting further development:
+
+| Currency | Address |
+|---|---|
+| BTC | `your-btc-address-here` |
+| ETH | `your-eth-address-here` |
+
+Thank you for your support! ⭐
 
 ---
 
