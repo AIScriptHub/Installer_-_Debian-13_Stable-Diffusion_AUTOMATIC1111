@@ -93,7 +93,7 @@ If a run fails partway through, simply re-run the script — completed steps are
 
 ```bash
 rm -rf ~/stable-diffusion-webui/venv
-bash SD-Automatic1111_install_D13.sh
+bash Installer_-_Debian-13_Stable-Diffusion_AUTOMATIC1111_v0.4.sh
 ```
 ## Disclaimer
 
